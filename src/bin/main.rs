@@ -65,17 +65,19 @@ async fn main() -> Result<()> {
     let (terminal, _cleanup) = term::init_crossterm()?;
 
     // Initialize and launch app
-    let ditto = try_init_ditto(
-        cli.app_id,
-        cli.token,
-        cli.custom_auth_url,
-        cli.websocket_url.clone(),
-        cli.p2p_enabled,
-    )
-    .await?;
+    let ditto = Arc::new(
+        try_init_ditto(
+            cli.app_id,
+            cli.token,
+            cli.custom_auth_url,
+            cli.websocket_url.clone(),
+            cli.p2p_enabled,
+        )
+        .await?,
+    );
     // Spawn UDP CoT listener (port 0 disables it)
     if cli.udp_port > 0 {
-        let ditto_udp = ditto.clone();
+        let ditto_udp = Arc::clone(&ditto);
         let udp_shutdown = shutdown.clone();
         let udp_port = cli.udp_port;
         tokio::spawn(async move {

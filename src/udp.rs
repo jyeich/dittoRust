@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use dittolive_ditto::Ditto;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use crate::tui::todolist::LocationItem;
 
 /// Bind a UDP socket on `port` and process incoming CoT (Cursor on Target) XML messages,
 /// upserting each entity into the Ditto `locations` collection by uid.
-pub async fn run_udp_listener(ditto: Ditto, port: u16) -> Result<()> {
+pub async fn run_udp_listener(ditto: Arc<Ditto>, port: u16) -> Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let socket = UdpSocket::bind(&addr)
         .await
@@ -93,7 +94,7 @@ fn parse_cot(xml: &str) -> Option<(String, f64, f64)> {
 }
 
 /// Insert a new location or update an existing one matched by `uid`.
-async fn upsert_location(ditto: &Ditto, uid: String, lat: f64, lon: f64) -> Result<()> {
+async fn upsert_location(ditto: &Arc<Ditto>, uid: String, lat: f64, lon: f64) -> Result<()> {
     let result = ditto
         .store()
         .execute_v2((

@@ -3,7 +3,7 @@ use crossterm::event::{Event, EventStream};
 use dittolive_ditto::prelude::*;
 use futures::{FutureExt, Stream, StreamExt};
 use ratatui::prelude::*;
-use std::{io::Stdout, ops::ControlFlow, time::Duration};
+use std::{io::Stdout, ops::ControlFlow, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 
 use crate::{should_quit, Shutdown};
@@ -25,7 +25,7 @@ impl TuiTask {
     pub fn try_spawn(
         shutdown: Shutdown,
         terminal: Terminal<CrosstermBackend<Stdout>>,
-        ditto: Ditto,
+        ditto: Arc<Ditto>,
         websocket_url: String,
         client_name: Option<String>,
     ) -> Result<TuiTask> {

@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
     let _ = ditto.start_sync();
     println!("✅ Created Ditto instance and started sync");
 
+    let ditto = Arc::new(ditto);
     let client_name = env::var("DITTO_CLIENT_NAME").ok();
     let todolist = Todolist::new(ditto, websocket_url, client_name)?;
     println!("📍 App loaded - Created locations instance");

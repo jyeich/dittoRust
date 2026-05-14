@@ -21,7 +21,7 @@ use crate::key;
 use super::EventResult;
 
 pub struct Todolist {
-    pub ditto: Ditto,
+    pub ditto: Arc<Ditto>,
     pub tasks_observer: Arc<StoreObserver>,
     pub tasks_rx: watch::Receiver<Vec<LocationItem>>,
     pub tasks_subscription: Arc<SyncSubscription>,
@@ -61,7 +61,7 @@ impl LocationItem {
 }
 
 impl Todolist {
-    pub fn new(ditto: Ditto, websocket_url: String, client_name: Option<String>) -> Result<Self> {
+    pub fn new(ditto: Arc<Ditto>, websocket_url: String, client_name: Option<String>) -> Result<Self> {
         let (tasks_tx, tasks_rx) = watch::channel(Vec::new());
 
         let tasks_subscription = ditto
