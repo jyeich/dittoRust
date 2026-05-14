@@ -32,10 +32,15 @@ pub struct Cli {
     #[clap(long, env = "DITTO_P2P_ENABLED", default_value = "true")]
     p2p_enabled: bool,
 
-    /// UDP port to listen for CoT (Cursor on Target) XML location updates.
+    /// UDP port to listen for incoming CoT (Cursor on Target) XML location updates.
     /// Set to 0 to disable the UDP listener.
     #[clap(long, env = "UDP_LISTEN_PORT", default_value = "4242")]
     udp_port: u16,
+
+    /// UDP address to forward CoT XML for locations received from remote Ditto peers.
+    /// Set to empty string to disable the UDP sender.
+    #[clap(long, env = "UDP_OUTPUT_ADDR", default_value = "127.0.0.1:4244")]
+    udp_output_addr: String,
 
     /// Path to write logs on disk
     #[clap(long, default_value = "/tmp/ditto-quickstart.log")]
@@ -75,9 +80,13 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
+    // Shared set of UIDs inserted by this app's UDP listener — the sender skips these
+    let local_uids = udp::new_local_uids();
+
     // Spawn UDP CoT listener (port 0 disables it)
     if cli.udp_port > 0 {
         let ditto_udp = Arc::clone(&ditto);
+        let uids = local_uids.clone();
         let udp_shutdown = shutdown.clone();
         let udp_port = cli.udp_port;
         tokio::spawn(async move {
@@ -85,9 +94,29 @@ async fn main() -> Result<()> {
                 _ = udp_shutdown.wait_shutdown_triggered() => {
                     tracing::info!("UDP listener stopping due to shutdown");
                 }
-                result = udp::run_udp_listener(ditto_udp, udp_port) => {
+                result = udp::run_udp_listener(ditto_udp, udp_port, uids) => {
                     if let Err(e) = result {
                         tracing::error!(%e, "UDP listener exited with error");
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn UDP CoT sender (empty addr disables it)
+    if !cli.udp_output_addr.is_empty() {
+        let ditto_udp = Arc::clone(&ditto);
+        let uids = local_uids.clone();
+        let udp_shutdown = shutdown.clone();
+        let output_addr = cli.udp_output_addr.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = udp_shutdown.wait_shutdown_triggered() => {
+                    tracing::info!("UDP sender stopping due to shutdown");
+                }
+                result = udp::run_udp_sender(ditto_udp, output_addr, uids) => {
+                    if let Err(e) = result {
+                        tracing::error!(%e, "UDP sender exited with error");
                     }
                 }
             }

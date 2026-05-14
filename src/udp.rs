@@ -1,15 +1,31 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use dittolive_ditto::Ditto;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
 use crate::tui::todolist::LocationItem;
 
-/// Bind a UDP socket on `port` and process incoming CoT (Cursor on Target) XML messages,
-/// upserting each entity into the Ditto `locations` collection by uid.
-pub async fn run_udp_listener(ditto: Arc<Ditto>, port: u16) -> Result<()> {
+/// Tracks UIDs that were inserted by this app's UDP listener so the sender
+/// can skip re-broadcasting them back out.
+pub type LocalUids = Arc<Mutex<HashSet<String>>>;
+
+pub fn new_local_uids() -> LocalUids {
+    Arc::new(Mutex::new(HashSet::new()))
+}
+
+/// Bind a UDP socket on `port`, parse incoming CoT XML, and upsert each entity
+/// into the Ditto `locations` collection. Inserted UIDs are recorded in `local_uids`
+/// so the sender knows not to echo them back out.
+pub async fn run_udp_listener(
+    ditto: Arc<Ditto>,
+    port: u16,
+    local_uids: LocalUids,
+) -> Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let socket = UdpSocket::bind(&addr)
         .await
@@ -31,6 +47,10 @@ pub async fn run_udp_listener(ditto: Arc<Ditto>, port: u16) -> Result<()> {
         match parse_cot(raw) {
             Some((uid, lat, lon)) => {
                 tracing::info!(from = %peer, %uid, %lat, %lon, "received CoT");
+                // Mark uid as locally originated before inserting
+                if let Ok(mut set) = local_uids.lock() {
+                    set.insert(uid.clone());
+                }
                 if let Err(e) = upsert_location(&ditto, uid, lat, lon).await {
                     tracing::error!(%e, "failed to upsert CoT location");
                 }
@@ -42,8 +62,98 @@ pub async fn run_udp_listener(ditto: Arc<Ditto>, port: u16) -> Result<()> {
     }
 }
 
+/// Watch the Ditto `locations` collection for changes that originated from remote
+/// peers (i.e. not in `local_uids`) and forward them as CoT XML to `output_addr`.
+pub async fn run_udp_sender(
+    ditto: Arc<Ditto>,
+    output_addr: String,
+    local_uids: LocalUids,
+) -> Result<()> {
+    // Bind on an ephemeral port for sending
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket
+        .connect(&output_addr)
+        .await
+        .with_context(|| format!("failed to connect UDP sender to {}", output_addr))?;
+    tracing::info!("UDP CoT sender connected to {}", output_addr);
+
+    let (tx, mut rx) = watch::channel(Vec::<LocationItem>::new());
+
+    // Register a Ditto observer — fires whenever the collection changes
+    let _observer = ditto.store().register_observer_v2(
+        "SELECT * FROM locations WHERE deleted=false ORDER BY _id ASC",
+        move |query_result| {
+            let docs = query_result
+                .into_iter()
+                .flat_map(|it| it.deserialize_value::<LocationItem>().ok())
+                .collect::<Vec<_>>();
+            tx.send_replace(docs);
+        },
+    )?;
+
+    // prev tracks the last known (lat, lon) per uid so we only send on change
+    let mut prev: HashMap<String, (f64, f64)> = HashMap::new();
+
+    loop {
+        rx.changed().await?;
+        let locations = rx.borrow().clone();
+
+        // Collect XML strings to send while holding the lock briefly, then send outside
+        let to_send: Vec<String> = {
+            let local = local_uids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("local_uids lock poisoned"))?;
+
+            locations
+                .iter()
+                .filter(|loc| !local.contains(&loc.uid))
+                .filter(|loc| match prev.get(&loc.uid) {
+                    None => true, // new remote item
+                    Some(&(plat, plon)) => {
+                        (plat - loc.lat).abs() > 1e-10 || (plon - loc.lon).abs() > 1e-10
+                    }
+                })
+                .map(|loc| format_cot(&loc.uid, loc.lat, loc.lon))
+                .collect()
+            // lock released here
+        };
+
+        for xml in &to_send {
+            if let Err(e) = socket.send(xml.as_bytes()).await {
+                tracing::error!(%e, "failed to send CoT UDP packet");
+            }
+        }
+
+        if !to_send.is_empty() {
+            tracing::debug!("forwarded {} location(s) to {}", to_send.len(), output_addr);
+        }
+
+        // Update previous state snapshot
+        prev = locations
+            .iter()
+            .map(|l| (l.uid.clone(), (l.lat, l.lon)))
+            .collect();
+    }
+}
+
+/// Format a Ditto location as a CoT XML string.
+fn format_cot(uid: &str, lat: f64, lon: f64) -> String {
+    let now = Utc::now();
+    let time_str = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let stale_str = (now + chrono::Duration::seconds(75))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" time="{time}" start="{time}" stale="{stale}" how="m-g"><point lat="{lat:.10}" lon="{lon:.10}" hae="9999999.0" ce="9999999.0" le="9999999.0"/><detail></detail></event>"#,
+        uid = uid,
+        lat = lat,
+        lon = lon,
+        time = time_str,
+        stale = stale_str,
+    )
+}
+
 /// Parse a CoT XML message and return `(uid, lat, lon)`.
-/// Extracts `uid` from `<event uid="...">` and `lat`/`lon` from `<point lat="..." lon="...">`.
 fn parse_cot(xml: &str) -> Option<(String, f64, f64)> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -59,9 +169,7 @@ fn parse_cot(xml: &str) -> Option<(String, f64, f64)> {
                     b"event" => {
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"uid" {
-                                uid = std::str::from_utf8(&attr.value)
-                                    .ok()
-                                    .map(str::to_owned);
+                                uid = std::str::from_utf8(&attr.value).ok().map(str::to_owned);
                             }
                         }
                     }
@@ -137,14 +245,12 @@ async fn upsert_location(ditto: &Arc<Ditto>, uid: String, lat: f64, lon: f64) ->
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cot;
+    use super::*;
 
     #[test]
     fn test_parse_cot_entity_alpha() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><event version="2.0" uid="Entity-Alpha" type="a-f-G-U-C" time="2026-05-14T14:29:15.93Z" start="2026-05-14T14:29:15.93Z" stale="2026-05-14T14:30:30.93Z" how="h-e" access="Undefined"><point lat="30.9223234883301" lon="-85.6955352795799" hae="100" ce="10" le="10"/><detail></detail></event>"#;
-        let result = parse_cot(xml);
-        assert!(result.is_some());
-        let (uid, lat, lon) = result.unwrap();
+        let (uid, lat, lon) = parse_cot(xml).unwrap();
         assert_eq!(uid, "Entity-Alpha");
         assert!((lat - 30.9223234883301).abs() < 1e-9);
         assert!((lon - -85.6955352795799).abs() < 1e-9);
@@ -162,5 +268,14 @@ mod tests {
     fn test_parse_cot_missing_point() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><event version="2.0" uid="No-Point"></event>"#;
         assert!(parse_cot(xml).is_none());
+    }
+
+    #[test]
+    fn test_format_cot_roundtrip() {
+        let xml = format_cot("Test-Entity", 30.9223, -85.6955);
+        let (uid, lat, lon) = parse_cot(&xml).unwrap();
+        assert_eq!(uid, "Test-Entity");
+        assert!((lat - 30.9223).abs() < 1e-6);
+        assert!((lon - -85.6955).abs() < 1e-6);
     }
 }
