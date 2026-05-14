@@ -42,15 +42,17 @@ pub enum TodoMode {
 pub struct LocationItem {
     #[serde(rename = "_id")]
     pub id: String,
+    pub uid: String,
     pub lat: f64,
     pub lon: f64,
     pub deleted: bool,
 }
 
 impl LocationItem {
-    pub fn new(lat: f64, lon: f64) -> Self {
+    pub fn new(uid: String, lat: f64, lon: f64) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            uid,
             lat,
             lon,
             deleted: false,
@@ -97,7 +99,7 @@ impl Todolist {
     fn render_todo_table(&mut self, area: Rect, buf: &mut Buffer) {
         let locations = self.tasks_rx.borrow().clone();
 
-        let header = ["Latitude".bold(), "Longitude".bold()]
+        let header = ["UID".bold(), "Latitude".bold(), "Longitude".bold()]
             .into_iter()
             .map(Cell::from)
             .collect::<Row>();
@@ -106,6 +108,7 @@ impl Todolist {
             .iter()
             .map(|doc| {
                 [
+                    Cell::from(Text::raw(doc.uid.clone())),
                     Cell::from(Text::raw(format!("{:.6}", doc.lat))),
                     Cell::from(Text::raw(format!("{:.6}", doc.lon))),
                 ]
@@ -130,7 +133,7 @@ impl Todolist {
         };
         let connection_line = Line::raw(connection_info).cyan();
 
-        let table = Table::new(rows, Constraint::from_percentages([50, 50]))
+        let table = Table::new(rows, Constraint::from_percentages([30, 35, 35]))
             .header(header)
             .highlight_symbol("❯❯ ")
             .row_highlight_style(Style::new().bold().blue())
@@ -158,7 +161,7 @@ impl Todolist {
         Clear.render(space, buf);
         Block::bordered()
             .border_type(BorderType::Rounded)
-            .title(" Enter Location (lat,lon) ")
+            .title(" Enter Location (uid,lat,lon) ")
             .title_bottom(" (Esc: back) ")
             .padding(Padding::uniform(1))
             .render(space, buf);
@@ -189,7 +192,7 @@ impl Todolist {
                     .context("failed to get location from list")?;
                 self.mode = TodoMode::EditLocation {
                     id: item.id.to_string(),
-                    buffer: format!("{},{}", item.lat, item.lon),
+                    buffer: format!("{},{},{}", item.uid, item.lat, item.lon),
                 };
             }
             (TodoMode::Normal, key!(Char('s'))) => {
@@ -210,8 +213,8 @@ impl Todolist {
             (TodoMode::CreateLocation { buffer }, key!(Enter)) => {
                 if !buffer.is_empty() {
                     let input = std::mem::take(buffer);
-                    if let Some((lat, lon)) = parse_lat_lon(&input) {
-                        self.try_create_location(lat, lon).await?;
+                    if let Some((uid, lat, lon)) = parse_uid_lat_lon(&input) {
+                        self.try_create_location(uid, lat, lon).await?;
                     }
                     self.mode = TodoMode::Normal;
                 }
@@ -220,8 +223,8 @@ impl Todolist {
                 if !buffer.is_empty() {
                     let input = std::mem::take(buffer);
                     let id = id.clone();
-                    if let Some((lat, lon)) = parse_lat_lon(&input) {
-                        self.try_edit_location(&id, lat, lon).await?;
+                    if let Some((uid, lat, lon)) = parse_uid_lat_lon(&input) {
+                        self.try_edit_location(&id, uid, lat, lon).await?;
                     }
                     self.mode = TodoMode::Normal;
                 }
@@ -278,8 +281,8 @@ impl Todolist {
         Ok(())
     }
 
-    pub async fn try_create_location(&mut self, lat: f64, lon: f64) -> Result<()> {
-        let location = LocationItem::new(lat, lon);
+    pub async fn try_create_location(&mut self, uid: String, lat: f64, lon: f64) -> Result<()> {
+        let location = LocationItem::new(uid, lat, lon);
         self.ditto
             .store()
             .execute_v2((
@@ -290,12 +293,13 @@ impl Todolist {
         Ok(())
     }
 
-    pub async fn try_edit_location(&mut self, id: &str, lat: f64, lon: f64) -> Result<()> {
+    pub async fn try_edit_location(&mut self, id: &str, uid: String, lat: f64, lon: f64) -> Result<()> {
         self.ditto
             .store()
             .execute_v2((
-                "UPDATE locations SET lat=:lat, lon=:lon WHERE _id=:id",
+                "UPDATE locations SET uid=:uid, lat=:lat, lon=:lon WHERE _id=:id",
                 serde_json::json!({
+                    "uid": uid,
                     "lat": lat,
                     "lon": lon,
                     "id": id
@@ -306,9 +310,10 @@ impl Todolist {
     }
 }
 
-fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
-    let mut parts = s.splitn(2, ',');
+fn parse_uid_lat_lon(s: &str) -> Option<(String, f64, f64)> {
+    let mut parts = s.splitn(3, ',');
+    let uid = parts.next()?.trim().to_string();
     let lat = parts.next()?.trim().parse().ok()?;
     let lon = parts.next()?.trim().parse().ok()?;
-    Some((lat, lon))
+    Some((uid, lat, lon))
 }
