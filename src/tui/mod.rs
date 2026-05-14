@@ -11,7 +11,7 @@ use crate::{should_quit, Shutdown};
 pub mod todolist;
 
 // Re-export for integration tests
-pub use todolist::{TodoItem, Todolist};
+pub use todolist::{LocationItem, Todolist};
 
 /// External handle for callers to interact with the tui task
 pub struct TuiTask {

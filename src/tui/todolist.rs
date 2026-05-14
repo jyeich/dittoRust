@@ -21,68 +21,38 @@ use crate::key;
 use super::EventResult;
 
 pub struct Todolist {
-    /// Our handle to the Ditto peer, used to create observers and subscriptions
     pub ditto: Ditto,
-
-    /// Ditto observer handles must be held (not dropped) to keep them alive
-    ///
-    /// Observers provide the actual callback triggers to allow handling events
     pub tasks_observer: Arc<StoreObserver>,
-
-    /// Our observer sends any document updates into this watch channel
-    pub tasks_rx: watch::Receiver<Vec<TodoItem>>,
-
-    /// Ditto subscriptions must also be held to keep them alive
-    ///
-    /// Subscriptions cause Ditto to sync selected data from other peers
+    pub tasks_rx: watch::Receiver<Vec<LocationItem>>,
     pub tasks_subscription: Arc<SyncSubscription>,
-
-    // Connection info for display
-    /// The WebSocket URL this client is connected to
     pub websocket_url: String,
-
-    /// Optional client name for display purposes
     pub client_name: Option<String>,
-
-    // TUI state below
     pub mode: TodoMode,
-
-    /// Table scrolling state
     pub table_state: TableState,
-
-    /// Holds the contents of a "new todo" dialog
-    ///
-    /// When this is "None", the dialog is closed. When "Some", it contains
-    /// the title being typed by the user.
-    pub create_task_title: Option<String>,
-
-    /// Holds the contents of an existing TODO title to be edited
-    pub edit_task: Option<(String, String)>, // (ID, title)
 }
 
-/// Mode enum used to decide how to interpret keystrokes
 #[derive(Debug)]
 pub enum TodoMode {
     Normal,
-    CreateTask { buffer: String },
-    EditTask { id: String, buffer: String },
+    CreateLocation { buffer: String },
+    EditLocation { id: String, buffer: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoItem {
+pub struct LocationItem {
     #[serde(rename = "_id")]
     pub id: String,
-    pub title: String,
-    pub done: bool,
+    pub lat: f64,
+    pub lon: f64,
     pub deleted: bool,
 }
 
-impl TodoItem {
-    pub fn new(title: String) -> Self {
+impl LocationItem {
+    pub fn new(lat: f64, lon: f64) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
-            title,
-            done: false,
+            lat,
+            lon,
             deleted: false,
         }
     }
@@ -92,20 +62,16 @@ impl Todolist {
     pub fn new(ditto: Ditto, websocket_url: String, client_name: Option<String>) -> Result<Self> {
         let (tasks_tx, tasks_rx) = watch::channel(Vec::new());
 
-        // Register a subscription, which determines what data syncs to this peer
-        // https://docs.ditto.live/sdk/latest/sync/syncing-data#creating-subscriptions
         let tasks_subscription = ditto
             .sync()
-            .register_subscription_v2("SELECT * FROM tasks")?;
+            .register_subscription_v2("SELECT * FROM locations")?;
 
-        // register observer for live query
-        // Register observer, which runs against the local database on this peer
         let tasks_observer = ditto.store().register_observer_v2(
-            "SELECT * FROM tasks WHERE deleted=false ORDER BY title ASC",
+            "SELECT * FROM locations WHERE deleted=false ORDER BY _id ASC",
             move |query_result| {
                 let docs = query_result
                     .into_iter()
-                    .flat_map(|it| it.deserialize_value::<TodoItem>().ok())
+                    .flat_map(|it| it.deserialize_value::<LocationItem>().ok())
                     .collect::<Vec<_>>();
                 tasks_tx.send_replace(docs);
             },
@@ -120,35 +86,28 @@ impl Todolist {
             websocket_url,
             client_name,
             mode: TodoMode::Normal,
-            create_task_title: None,
-            edit_task: None,
         })
     }
 
-    /// Top-level render function for the Todolist
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         self.render_todo_table(area, buf);
-        self.render_new_todo_prompt(area, buf);
+        self.render_location_prompt(area, buf);
     }
 
-    /// Render a table displaying each todo and its current status
     fn render_todo_table(&mut self, area: Rect, buf: &mut Buffer) {
-        let tasks = self.tasks_rx.borrow().clone();
+        let locations = self.tasks_rx.borrow().clone();
 
-        let header = ["Done".bold(), "Title".bold()]
+        let header = ["Latitude".bold(), "Longitude".bold()]
             .into_iter()
             .map(Cell::from)
             .collect::<Row>();
-        let rows = tasks
+
+        let rows = locations
             .iter()
             .map(|doc| {
-                let done = doc.done;
-                let done = if done { " ✅ " } else { " ☐ " };
-                let title = &doc.title;
-
                 [
-                    Cell::from(Text::from(done.to_string())),
-                    Cell::from(Text::raw(title)),
+                    Cell::from(Text::raw(format!("{:.6}", doc.lat))),
+                    Cell::from(Text::raw(format!("{:.6}", doc.lon))),
                 ]
                 .into_iter()
                 .collect::<Row>()
@@ -164,7 +123,6 @@ impl Todolist {
             .into_iter()
             .collect::<Line>();
 
-        // Format connection info: "client_name@websocket_url" or just "websocket_url"
         let connection_info = if let Some(ref client_name) = self.client_name {
             format!(" {}@{} ", client_name, self.websocket_url)
         } else {
@@ -172,14 +130,14 @@ impl Todolist {
         };
         let connection_line = Line::raw(connection_info).cyan();
 
-        let table = Table::new(rows, Constraint::from_percentages([30, 70]))
+        let table = Table::new(rows, Constraint::from_percentages([50, 50]))
             .header(header)
             .highlight_symbol("❯❯ ")
             .row_highlight_style(Style::new().bold().blue())
             .block(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
-                    .title_top(Line::raw(" Tasks (j↓, k↑, ⏎ toggle done) ").left_aligned())
+                    .title_top(Line::raw(" Locations (j↓, k↑) ").left_aligned())
                     .title_top(sync_line.right_aligned())
                     .title_bottom(
                         Line::raw(" (c: create) (d: delete) (e: edit) (q: quit) ").left_aligned(),
@@ -189,42 +147,35 @@ impl Todolist {
         StatefulWidget::render(table, area, buf, &mut self.table_state);
     }
 
-    /// Render "new todo" prompt if `create_task_title` is "Some"
-    fn render_new_todo_prompt(&self, area: Rect, buf: &mut Buffer) {
-        let title = match &self.mode {
-            TodoMode::CreateTask { buffer } => buffer,
-            TodoMode::EditTask { buffer, .. } => buffer,
-            _ => {
-                return;
-            }
+    fn render_location_prompt(&self, area: Rect, buf: &mut Buffer) {
+        let buffer = match &self.mode {
+            TodoMode::CreateLocation { buffer } => buffer,
+            TodoMode::EditLocation { buffer, .. } => buffer,
+            _ => return,
         };
 
         let space = area.inner(Margin::new(2, 2));
         Clear.render(space, buf);
         Block::bordered()
             .border_type(BorderType::Rounded)
-            .title(" New Todo ")
+            .title(" Enter Location (lat,lon) ")
             .title_bottom(" (Esc: back) ")
             .padding(Padding::uniform(1))
             .render(space, buf);
         let space = space.inner(Margin::new(2, 2));
-        Line::raw(title).render(space, buf);
+        Line::raw(buffer).render(space, buf);
     }
 
-    /// Apply a terminal event to update the todolist state
     pub async fn try_handle_event(&mut self, event: &Event) -> Result<EventResult> {
         match (&mut self.mode, event) {
-            // Normal:c -> Goto create mode
             (TodoMode::Normal, key!(Char('c'))) => {
-                self.mode = TodoMode::CreateTask {
+                self.mode = TodoMode::CreateLocation {
                     buffer: String::new(),
                 };
             }
-            // Normal:d -> Delete task
             (TodoMode::Normal, key!(Char('d'))) => {
-                self.try_delete_task().await?;
+                self.try_delete_location().await?;
             }
-            // Normal:e -> Goto edit mode
             (TodoMode::Normal, key!(Char('e'))) => {
                 let selected = self
                     .table_state
@@ -235,59 +186,51 @@ impl Todolist {
                     .borrow()
                     .get(selected)
                     .cloned()
-                    .context("failed to get todo from list")?;
-                self.mode = TodoMode::EditTask {
+                    .context("failed to get location from list")?;
+                self.mode = TodoMode::EditLocation {
                     id: item.id.to_string(),
-                    buffer: item.title.to_string(),
+                    buffer: format!("{},{}", item.lat, item.lon),
                 };
             }
             (TodoMode::Normal, key!(Char('s'))) => {
                 self.toggle_sync()?;
             }
-            // Non-Normal:Esc -> Normal
-            (TodoMode::CreateTask { .. } | TodoMode::EditTask { .. }, key!(Esc)) => {
+            (TodoMode::CreateLocation { .. } | TodoMode::EditLocation { .. }, key!(Esc)) => {
                 self.mode = TodoMode::Normal;
             }
-            // Scroll up
             (TodoMode::Normal, key!(Up) | key!(Char('k'))) => {
                 self.table_state.select_previous();
             }
-            // Scroll down
             (TodoMode::Normal, key!(Down) | key!(Char('j'))) => {
                 self.table_state.select_next();
             }
-            // Toggle done
-            (TodoMode::Normal, key!(Enter)) => {
-                self.try_toggle_done().await?;
-            }
-            // Create task typing
-            (TodoMode::CreateTask { buffer }, key!(Char(ch))) => {
+            (TodoMode::CreateLocation { buffer }, key!(Char(ch))) => {
                 buffer.push(*ch);
             }
-            // Submit create task
-            (TodoMode::CreateTask { buffer }, key!(Enter)) => {
+            (TodoMode::CreateLocation { buffer }, key!(Enter)) => {
                 if !buffer.is_empty() {
-                    let title = std::mem::take(buffer);
-                    self.try_create_new_todo(title).await?;
+                    let input = std::mem::take(buffer);
+                    if let Some((lat, lon)) = parse_lat_lon(&input) {
+                        self.try_create_location(lat, lon).await?;
+                    }
                     self.mode = TodoMode::Normal;
                 }
             }
-            // Submit edit task
-            (TodoMode::EditTask { id, buffer }, key!(Enter)) => {
+            (TodoMode::EditLocation { id, buffer }, key!(Enter)) => {
                 if !buffer.is_empty() {
-                    let title = std::mem::take(buffer);
+                    let input = std::mem::take(buffer);
                     let id = id.clone();
-                    self.try_edit_todo(&id, &title).await?;
+                    if let Some((lat, lon)) = parse_lat_lon(&input) {
+                        self.try_edit_location(&id, lat, lon).await?;
+                    }
                     self.mode = TodoMode::Normal;
                 }
             }
-            // Edit task typing
-            (TodoMode::EditTask { buffer, .. }, key!(Char(ch))) => {
+            (TodoMode::EditLocation { buffer, .. }, key!(Char(ch))) => {
                 buffer.push(*ch);
             }
-            // Backspace
             (
-                TodoMode::CreateTask { buffer } | TodoMode::EditTask { buffer, .. },
+                TodoMode::CreateLocation { buffer } | TodoMode::EditLocation { buffer, .. },
                 key!(Backspace),
             ) => {
                 if buffer.is_empty() {
@@ -313,88 +256,59 @@ impl Todolist {
         Ok(())
     }
 
-    /// Toggle "done" for the currently selected item in the list
-    async fn try_toggle_done(&self) -> Result<()> {
-        let tasks = self.tasks_rx.borrow().clone();
-        let task_index = self
+    pub async fn try_delete_location(&mut self) -> Result<()> {
+        let locations = self.tasks_rx.borrow().clone();
+        let index = self
             .table_state
             .selected()
-            .context("failed to get todolist selected index")?;
-        let selected_task = tasks
-            .get(task_index)
+            .context("failed to get selected index")?;
+        let selected = locations
+            .get(index)
             .cloned()
-            .context("failed to find selected task")?;
+            .context("failed to find selected location")?;
 
-        let id = selected_task.id.to_string();
-        let done = selected_task.done;
         self.ditto
             .store()
             .execute_v2((
-                "UPDATE tasks SET done=:done WHERE _id=:id",
-                serde_json::json!({
-                    "id": id,
-                    "done": !done,
-                }),
+                "UPDATE locations SET deleted=true WHERE _id=:id",
+                serde_json::json!({ "id": selected.id }),
             ))
             .await?;
 
         Ok(())
     }
 
-    /// Delete the task item currently selected in the list
-    pub async fn try_delete_task(&mut self) -> Result<()> {
-        let tasks = self.tasks_rx.borrow().clone();
-        let task_index = self
-            .table_state
-            .selected()
-            .context("failed to get todolist selected index")?;
-        let selected_task = tasks
-            .get(task_index)
-            .cloned()
-            .context("failed to find selected task")?;
-
-        let id = selected_task.id;
+    pub async fn try_create_location(&mut self, lat: f64, lon: f64) -> Result<()> {
+        let location = LocationItem::new(lat, lon);
         self.ditto
             .store()
             .execute_v2((
-                "UPDATE tasks SET deleted=true WHERE _id=:id",
+                "INSERT INTO locations DOCUMENTS (:location)",
+                serde_json::json!({ "location": location }),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn try_edit_location(&mut self, id: &str, lat: f64, lon: f64) -> Result<()> {
+        self.ditto
+            .store()
+            .execute_v2((
+                "UPDATE locations SET lat=:lat, lon=:lon WHERE _id=:id",
                 serde_json::json!({
+                    "lat": lat,
+                    "lon": lon,
                     "id": id
                 }),
             ))
             .await?;
-
         Ok(())
     }
+}
 
-    /// Create a new task todo with the given title
-    pub async fn try_create_new_todo(&mut self, title: String) -> Result<()> {
-        let task = TodoItem::new(title);
-        self.ditto
-            .store()
-            .execute_v2((
-                "INSERT INTO tasks DOCUMENTS (:task)",
-                serde_json::json!({
-                    "task": task
-                }),
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// Set the title of the task with the given ID
-    pub async fn try_edit_todo(&mut self, id: &str, title: &str) -> Result<()> {
-        self.ditto
-            .store()
-            .execute_v2((
-                "UPDATE tasks SET title=:title WHERE _id=:id",
-                serde_json::json!({
-                    "title": title,
-                    "id": id
-                }),
-            ))
-            .await?;
-
-        Ok(())
-    }
+fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
+    let mut parts = s.splitn(2, ',');
+    let lat = parts.next()?.trim().parse().ok()?;
+    let lon = parts.next()?.trim().parse().ok()?;
+    Some((lat, lon))
 }
