@@ -3,19 +3,20 @@ use chrono::Utc;
 use dittolive_ditto::Ditto;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
 use crate::tui::todolist::LocationItem;
 
-/// Tracks UIDs that were inserted by this app's UDP listener so the sender
-/// can skip re-broadcasting them back out.
-pub type LocalUids = Arc<Mutex<HashSet<String>>>;
+/// Tracks UIDs and the exact position inserted by this app's UDP listener so
+/// the sender can skip re-broadcasting that specific position back out.
+/// Keyed by uid, value is the (lat, lon) that was locally inserted.
+pub type LocalUids = Arc<Mutex<HashMap<String, (f64, f64)>>>;
 
 pub fn new_local_uids() -> LocalUids {
-    Arc::new(Mutex::new(HashSet::new()))
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 /// Bind a UDP socket on `port`, parse incoming CoT XML, and upsert each entity
@@ -47,9 +48,11 @@ pub async fn run_udp_listener(
         match parse_cot(raw) {
             Some((uid, lat, lon)) => {
                 tracing::info!(from = %peer, %uid, %lat, %lon, "received CoT");
-                // Mark uid as locally originated before inserting
-                if let Ok(mut set) = local_uids.lock() {
-                    set.insert(uid.clone());
+                // Record the exact position we're inserting so the sender
+                // can suppress only this specific (uid, lat, lon), not all
+                // future updates to this uid from remote peers.
+                if let Ok(mut map) = local_uids.lock() {
+                    map.insert(uid.clone(), (lat, lon));
                 }
                 if let Err(e) = upsert_location(&ditto, uid, lat, lon).await {
                     tracing::error!(%e, "failed to upsert CoT location");
@@ -106,7 +109,14 @@ pub async fn run_udp_sender(
 
             locations
                 .iter()
-                .filter(|loc| !local.contains(&loc.uid))
+                .filter(|loc| match local.get(&loc.uid) {
+                        None => true,
+                        // Only suppress if the position exactly matches what we inserted.
+                        // A remote update with different coords must still be forwarded.
+                        Some(&(plat, plon)) => {
+                            (plat - loc.lat).abs() > 1e-10 || (plon - loc.lon).abs() > 1e-10
+                        }
+                    })
                 .filter(|loc| match prev.get(&loc.uid) {
                     None => true, // new remote item
                     Some(&(plat, plon)) => {
