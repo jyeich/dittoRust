@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use ditto_quickstart::{term, tui::TuiTask, Shutdown};
+use ditto_quickstart::{term, tui::TuiTask, udp, Shutdown};
 use dittolive_ditto::{fs::TempRoot, identity::OnlinePlayground, AppId, Ditto};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -31,6 +31,11 @@ pub struct Cli {
     /// Enable peer-to-peer transports (LAN, Bluetooth). Set to false to force all communication through Big Peer.
     #[clap(long, env = "DITTO_P2P_ENABLED", default_value = "true")]
     p2p_enabled: bool,
+
+    /// UDP port to listen for CoT (Cursor on Target) XML location updates.
+    /// Set to 0 to disable the UDP listener.
+    #[clap(long, env = "UDP_LISTEN_PORT", default_value = "4242")]
+    udp_port: u16,
 
     /// Path to write logs on disk
     #[clap(long, default_value = "/tmp/ditto-quickstart.log")]
@@ -68,6 +73,25 @@ async fn main() -> Result<()> {
         cli.p2p_enabled,
     )
     .await?;
+    // Spawn UDP CoT listener (port 0 disables it)
+    if cli.udp_port > 0 {
+        let ditto_udp = ditto.clone();
+        let udp_shutdown = shutdown.clone();
+        let udp_port = cli.udp_port;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = udp_shutdown.wait_shutdown_triggered() => {
+                    tracing::info!("UDP listener stopping due to shutdown");
+                }
+                result = udp::run_udp_listener(ditto_udp, udp_port) => {
+                    if let Err(e) = result {
+                        tracing::error!(%e, "UDP listener exited with error");
+                    }
+                }
+            }
+        });
+    }
+
     let _tui_task = TuiTask::try_spawn(
         shutdown.clone(),
         terminal,

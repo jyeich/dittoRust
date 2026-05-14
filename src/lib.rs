@@ -7,6 +7,7 @@ use crossterm::event::{Event, KeyEvent, KeyModifiers};
 
 pub mod term;
 pub mod tui;
+pub mod udp;
 
 /// Crate alias for a shutdown handle that carries an [`anyhow::Error`]
 pub type Shutdown<T = Arc<anyhow::Error>> = async_shutdown::ShutdownManager<T>;
